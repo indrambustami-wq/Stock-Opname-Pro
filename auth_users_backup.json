@@ -1,0 +1,60 @@
+{
+  "admin": {
+    "username": "indra",
+    "salt": "e2a4d0c688743d555696f3905c034040",
+    "hash": "f20871d2f3cf25cda944c2fcfa2987f0c27bf6bb5d18146aef004497c9493eed",
+    "security_question": "Nama panggilan masa kecil Anda?",
+    "security_salt": "47b5df134f0cfe25d9b37ab2ea2a95b1",
+    "security_hash": "af8af54d529a4422f5895c6a1d27263e3001a0e943bdeba9bd45c38282d1a6b5"
+  },
+  "users": {
+    "oji": {
+      "display_name": "Oji",
+      "note": "123456",
+      "salt": "0e9a11e6a5521b4a7bd501d7c5801e1a",
+      "hash": "4cbd32befc519002ec1fd7fa2a143240764647605c347fdd614913bb56df39c2",
+      "status": "approved",
+      "requested_at": "2026-09-22 10:46:38",
+      "decided_at": "2026-09-22 10:46:38",
+      "security_question": null,
+      "security_salt": null,
+      "security_hash": null
+    },
+    "agus": {
+      "display_name": "agus",
+      "note": "",
+      "salt": "f5a172ac0744e979d08266e5fdb2eb3d",
+      "hash": "922a141e37371191b503b62e5ad04bb100281a0bda4e638df0f9dae62677f7ff",
+      "status": "approved",
+      "requested_at": "2026-09-22 10:48:53",
+      "decided_at": "2026-09-22 10:49:10",
+      "security_question": "Kota tempat Anda lahir?",
+      "security_salt": "def7a6d870175b062d68cdd435a4db95",
+      "security_hash": "87e47ab80b79ec03ad47375a2cd6b034c827c7b1aa92c1e508fe1d4290f4985e"
+    },
+    "user_indra": {
+      "display_name": "indra",
+      "note": "",
+      "salt": "898936bdf2f25eabc95ec2e477844b62",
+      "hash": "f2b3e5855568dc9776752055b0be11cf60ef57dd6460e0158b207ae9599b7dd7",
+      "status": "approved",
+      "requested_at": "2026-09-22 11:07:14",
+      "decided_at": "2026-09-22 11:07:34",
+      "security_question": "Nama panggilan masa kecil Anda?",
+      "security_salt": "aa44d851a5d462a9fd1fdbd968e7471d",
+      "security_hash": "966eae6b5d8389d8057b10f441dd9c7ef5e26413e9d290f23373532206bce0db"
+    },
+    "agus_satu": {
+      "display_name": "Agus Satu",
+      "note": "HPN",
+      "salt": "859a50657fbe550e4a67ca1d3dcb405a",
+      "hash": "8c66cec48ca9577909acced93c665c19cf220593344112df064198f66c90400d",
+      "status": "approved",
+      "requested_at": "2026-09-22 11:22:42",
+      "decided_at": "2026-09-22 11:23:32",
+      "security_question": "Nama hewan peliharaan pertama Anda?",
+      "security_salt": "c9e8c305e16f4544644268f3152bb740",
+      "security_hash": "c338dac5d6ffaa3dd0a4203d8c5e0412e9c687980c9ef0079a6933410d6e8618"
+    }
+  }
+}
