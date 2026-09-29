@@ -6,11 +6,13 @@ import json
 import os
 import re
 import secrets as pysecrets
+import time
 import warnings
 from datetime import datetime
 from html import escape as html_escape
 
 import pandas as pd
+import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -54,6 +56,17 @@ st.markdown(
     /* ========================================================
        STOCK OPNAME PRO - MOBILE FIRST UI
        ======================================================== */
+    /* iframe 0px pembawa script cookie login: jangan ikut menambah jarak */
+    div[data-testid="stElementContainer"]:has(iframe[height="0"]),
+    .element-container:has(iframe[height="0"]) {
+        position: absolute !important;
+        width: 0 !important;
+        height: 0 !important;
+        overflow: hidden !important;
+        opacity: 0 !important;
+        pointer-events: none !important;
+    }
+
     :root {
         --so-navy: #1F497D;
         --so-blue: #2F75B5;
@@ -4742,26 +4755,69 @@ def create_berita_acara_docx(
 #     lewat panel "Kelola Akses User" (muncul di sidebar saat
 #     Anda login sebagai admin).
 #
-# Data akun disimpan di file JSON (AUTH_DB_PATH) di folder yang
-# sama dengan file aplikasi ini. CATATAN: kalau aplikasi
-# dijalankan di layanan hosting yang storage-nya sementara
-# (mis. sebagian free-tier Streamlit Community Cloud yang
-# reset saat redeploy), daftar user bisa ikut hilang saat
-# redeploy. Untuk pemakaian jangka panjang, taruh file ini di
-# folder yang persistent (disk sendiri / server sendiri), atau
-# minta admin backup file JSON-nya secara berkala lewat menu
-# "Unduh Backup Data User" di panel admin.
+# PENYIMPANAN DATA AKUN
+# ---------------------
+# Ada dua mode, dipilih otomatis:
+#
+#   1) DATABASE PERMANEN (disarankan, wajib di Streamlit Cloud)
+#      Aktif kalau di Secrets ada SUPABASE_URL dan SUPABASE_KEY.
+#      Data akun disimpan di tabel "auth_store" milik Supabase,
+#      jadi TIDAK hilang saat app reboot / redeploy / tidur.
+#      Buat tabelnya sekali saja di Supabase (SQL Editor):
+#
+#         create table if not exists public.auth_store (
+#           id int primary key,
+#           data jsonb not null,
+#           updated_at timestamptz default now()
+#         );
+#         alter table public.auth_store enable row level security;
+#
+#      Lalu isi Secrets (Streamlit Cloud: App settings > Secrets):
+#
+#         SUPABASE_URL = "https://xxxx.supabase.co"
+#         SUPABASE_KEY = "<service_role / secret key>"
+#         ADMIN_INITIAL_PASSWORD = "password-awal-admin-anda"
+#
+#      ADMIN_INITIAL_PASSWORD hanya dipakai sekali, saat data
+#      akun pertama kali dibuat. Setelah itu ganti lewat menu
+#      "Ganti Password & Keamanan".
+#
+#   2) FILE LOKAL (cadangan kalau Secrets belum diisi)
+#      Data disimpan di auth_users.json di folder aplikasi.
+#      Di hosting dengan disk sementara file ini bisa hilang.
+#
+# Aplikasi TIDAK PERNAH menimpa data akun dengan data default
+# kalau penyimpanan gagal dibaca (jaringan putus, file rusak);
+# yang muncul hanya pesan error.
+#
+# LOGIN OTOMATIS (refresh / "Ingat saya")
+# ---------------------------------------
+# Setelah login, browser menyimpan cookie "aksa_auth" berisi token
+# bertanda tangan (HMAC). Saat halaman direfresh, token itu dicek
+# dan user langsung masuk tanpa login ulang.
+#   - "Ingat saya" dicentang     : berlaku 30 hari.
+#   - "Ingat saya" tidak dicentang: berlaku sampai browser ditutup
+#                                   (maks. 12 jam).
+# Token otomatis tidak berlaku lagi kalau password diganti atau
+# akun dinonaktifkan. Logout menghapus cookie. Butuh Streamlit
+# >= 1.37 (st.context.cookies).
 
 AUTH_DB_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "auth_users.json",
 )
 
-# Dipakai HANYA saat file auth_users.json belum ada sama sekali
-# (pertama kali aplikasi dijalankan). Setelah itu password admin
-# yang berlaku adalah yang tersimpan di file tersebut -- ganti
-# lewat menu "Ganti Password Admin", jangan mengedit angka di
-# sini.
+AUTH_REMOTE_TABLE = "auth_store"
+AUTH_REMOTE_ROW_ID = 1
+AUTH_CACHE_TTL = 5  # detik, cache baca database supaya tidak lambat
+
+AUTH_COOKIE_NAME = "aksa_auth"
+AUTH_REMEMBER_SECONDS = 30 * 24 * 3600
+AUTH_SESSION_SECONDS = 12 * 3600
+
+# Dipakai HANYA saat data akun belum ada sama sekali (pertama
+# kali dijalankan). Sebaiknya isi ADMIN_INITIAL_PASSWORD di Secrets
+# supaya password default ini tidak dipakai.
 DEFAULT_ADMIN_USERNAME = "indra"
 DEFAULT_ADMIN_PASSWORD = "ubah-password-ini"
 
@@ -4809,9 +4865,221 @@ def _verify_password(password, salt_hex, expected_hash):
     return hmac.compare_digest(digest, expected_hash)
 
 
+class AuthStorageError(Exception):
+    """Penyimpanan data akun tidak bisa dibaca/ditulis."""
+
+
+def _secret(name, default=None):
+    """Baca dari environment variable, lalu st.secrets."""
+
+    val = os.environ.get(name)
+
+    if val:
+        return val
+
+    try:
+        val = st.secrets[name]
+    except Exception:
+        return default
+
+    return str(val) if val else default
+
+
+def _remote_cfg():
+    """(url_tabel, api_key) kalau Supabase dikonfigurasi, else None."""
+
+    base = _secret("SUPABASE_URL")
+    key = _secret("SUPABASE_KEY")
+
+    if base and key:
+        return (
+            base.rstrip("/") + "/rest/v1/" + AUTH_REMOTE_TABLE,
+            key,
+        )
+
+    return None
+
+
+def _remote_headers(key, extra=None):
+
+    headers = {
+        "apikey": key,
+        "Content-Type": "application/json",
+    }
+
+    # Key model baru (sb_secret_... / sb_publishable_...) bukan JWT,
+    # jadi cukup lewat header apikey. Key legacy (JWT: anon /
+    # service_role) tetap dikirim juga sebagai Bearer.
+    if not key.startswith("sb_"):
+        headers["Authorization"] = "Bearer " + key
+
+    if extra:
+        headers.update(extra)
+
+    return headers
+
+
+@st.cache_data(ttl=AUTH_CACHE_TTL, show_spinner=False)
+def _remote_read_cached(url, key):
+    """Return dict data akun, atau None kalau barisnya belum ada."""
+
+    try:
+        resp = requests.get(
+            url,
+            params={
+                "id": f"eq.{AUTH_REMOTE_ROW_ID}",
+                "select": "data",
+            },
+            headers=_remote_headers(key),
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        raise AuthStorageError(
+            f"Tidak bisa terhubung ke database ({exc.__class__.__name__})."
+        )
+
+    if resp.status_code != 200:
+        raise AuthStorageError(
+            f"Database menolak permintaan baca "
+            f"(HTTP {resp.status_code}): {resp.text[:200]}"
+        )
+
+    rows = resp.json()
+
+    if not rows:
+        return None
+
+    return rows[0]["data"]
+
+
+def _remote_write(url, key, db):
+
+    try:
+        resp = requests.post(
+            url,
+            params={"on_conflict": "id"},
+            headers=_remote_headers(
+                key,
+                {
+                    "Prefer": (
+                        "resolution=merge-duplicates,"
+                        "return=minimal"
+                    )
+                },
+            ),
+            data=json.dumps(
+                {"id": AUTH_REMOTE_ROW_ID, "data": db},
+                ensure_ascii=False,
+            ).encode("utf-8"),
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        raise AuthStorageError(
+            f"Tidak bisa terhubung ke database ({exc.__class__.__name__})."
+        )
+
+    if resp.status_code not in (200, 201, 204):
+        raise AuthStorageError(
+            f"Database menolak permintaan simpan "
+            f"(HTTP {resp.status_code}): {resp.text[:200]}"
+        )
+
+    _remote_read_cached.clear()
+
+
+def _valid_auth_db(db):
+    return (
+        isinstance(db, dict)
+        and isinstance(db.get("admin"), dict)
+        and isinstance(db.get("users"), dict)
+    )
+
+
+def _local_read():
+    """Return dict, None kalau file belum ada. Error kalau rusak."""
+
+    if not os.path.exists(AUTH_DB_PATH):
+        return None
+
+    try:
+        with open(AUTH_DB_PATH, "r", encoding="utf-8") as fh:
+            db = json.load(fh)
+    except Exception as exc:
+        raise AuthStorageError(
+            f"File {os.path.basename(AUTH_DB_PATH)} ada tapi tidak "
+            f"bisa dibaca ({exc.__class__.__name__}). File tidak "
+            f"ditimpa; periksa atau pulihkan dari backup."
+        )
+
+    if not _valid_auth_db(db):
+        raise AuthStorageError(
+            f"Format {os.path.basename(AUTH_DB_PATH)} tidak valid. "
+            f"File tidak ditimpa."
+        )
+
+    return db
+
+
+def _local_write(db):
+
+    tmp = AUTH_DB_PATH + ".tmp"
+
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(db, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, AUTH_DB_PATH)
+    except OSError as exc:
+        raise AuthStorageError(
+            f"Tidak bisa menulis file akun ({exc})."
+        )
+
+
+def _read_auth_store():
+    """Return dict atau None (belum ada data sama sekali)."""
+
+    cfg = _remote_cfg()
+
+    if cfg:
+        db = _remote_read_cached(*cfg)
+        if db is not None and not _valid_auth_db(db):
+            raise AuthStorageError(
+                "Format data akun di database tidak valid."
+            )
+        return db
+
+    return _local_read()
+
+
+def _write_auth_store(db):
+
+    cfg = _remote_cfg()
+
+    if cfg:
+        _remote_write(cfg[0], cfg[1], db)
+    else:
+        _local_write(db)
+
+
+def _new_default_db():
+
+    salt_hex, digest = _hash_password(
+        _secret("ADMIN_INITIAL_PASSWORD", DEFAULT_ADMIN_PASSWORD)
+    )
+
+    return {
+        "admin": {
+            "username": DEFAULT_ADMIN_USERNAME,
+            "salt": salt_hex,
+            "hash": digest,
+        },
+        "users": {},
+        "cookie_secret": os.urandom(32).hex(),
+    }
+
+
 def _load_auth_db():
     """
-    Struktur file:
+    Struktur data:
     {
       "admin": {"username": "...", "salt": "...", "hash": "..."},
       "users": {
@@ -4825,39 +5093,220 @@ def _load_auth_db():
           "decided_at": "...",
         },
         ...
-      }
+      },
+      "cookie_secret": "..."   # penanda tangan token login
     }
     """
 
-    if os.path.exists(AUTH_DB_PATH):
-        try:
-            with open(AUTH_DB_PATH, "r", encoding="utf-8") as fh:
-                db = json.load(fh)
-            if "admin" in db and "users" in db:
-                return db
-        except Exception:
-            pass
+    try:
+        db = _read_auth_store()
 
-    salt_hex, digest = _hash_password(DEFAULT_ADMIN_PASSWORD)
+        if db is None:
+            # Belum ada data di penyimpanan utama. Kalau sebelumnya
+            # ada file lokal yang valid, pakai itu sebagai data awal
+            # (migrasi ke database); kalau tidak, buat akun admin.
+            db = None
+            if _remote_cfg():
+                db = _local_read()
+            if db is None:
+                db = _new_default_db()
+            if not db.get("cookie_secret"):
+                db["cookie_secret"] = os.urandom(32).hex()
+            _write_auth_store(db)
 
-    db = {
-        "admin": {
-            "username": DEFAULT_ADMIN_USERNAME,
-            "salt": salt_hex,
-            "hash": digest,
-        },
-        "users": {},
-    }
+        elif not db.get("cookie_secret"):
+            db["cookie_secret"] = os.urandom(32).hex()
+            _write_auth_store(db)
 
-    _save_auth_db(db)
+    except AuthStorageError as exc:
+        st.error(
+            "⚠️ Data akun tidak bisa diakses, jadi tidak ada data "
+            "yang diubah.\n\n" + str(exc) + "\n\nCoba muat ulang "
+            "halaman beberapa saat lagi."
+        )
+        st.stop()
 
     return db
 
 
 def _save_auth_db(db):
 
-    with open(AUTH_DB_PATH, "w", encoding="utf-8") as fh:
-        json.dump(db, fh, ensure_ascii=False, indent=2)
+    try:
+        _write_auth_store(db)
+    except AuthStorageError as exc:
+        st.error(
+            "⚠️ Perubahan GAGAL disimpan.\n\n" + str(exc)
+        )
+        st.stop()
+
+
+# ------------------------------------------------------------
+# Token login (cookie) -- supaya refresh / "Ingat saya" berfungsi
+# ------------------------------------------------------------
+
+def _b64e(raw):
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _b64d(text):
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def _pwd_fingerprint(record):
+    """Berubah otomatis kalau password diganti -> token lama mati."""
+
+    return hashlib.sha256(
+        record["hash"].encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def _token_sig(db, body):
+
+    return hmac.new(
+        db["cookie_secret"].encode("utf-8"),
+        body.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _make_auth_token(db, username, role, remember):
+
+    record = (
+        db["admin"] if role == "admin" else db["users"][username]
+    )
+
+    ttl = (
+        AUTH_REMEMBER_SECONDS if remember else AUTH_SESSION_SECONDS
+    )
+
+    payload = {
+        "u": username,
+        "r": role,
+        "m": 1 if remember else 0,
+        "e": int(time.time()) + ttl,
+        "f": _pwd_fingerprint(record),
+    }
+
+    body = _b64e(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    )
+
+    return body + "." + _token_sig(db, body)
+
+
+def _verify_auth_token(db, token):
+    """Return (username, role, display_name, remember) atau None."""
+
+    try:
+        body, sig = token.rsplit(".", 1)
+
+        if not hmac.compare_digest(sig, _token_sig(db, body)):
+            return None
+
+        payload = json.loads(_b64d(body))
+
+        if payload["e"] < time.time():
+            return None
+
+        username = payload["u"]
+        role = payload["r"]
+
+        if role == "admin":
+            record = db["admin"]
+            if username != record["username"].strip().lower():
+                return None
+            display_name = "Admin"
+        else:
+            record = db["users"].get(username)
+            if not record or record.get("status") != "approved":
+                return None
+            display_name = record["display_name"]
+
+        if not hmac.compare_digest(
+            payload["f"], _pwd_fingerprint(record)
+        ):
+            return None
+
+        return username, role, display_name, bool(payload.get("m"))
+
+    except Exception:
+        return None
+
+
+def _read_auth_cookie():
+
+    try:
+        return st.context.cookies.get(AUTH_COOKIE_NAME)
+    except Exception:
+        return None
+
+
+def _render_cookie_js(token, max_age):
+    """
+    Pasang / hapus cookie login di browser lewat iframe 0px.
+    token=None -> hapus cookie. max_age=None -> cookie sesi
+    (hilang saat browser ditutup).
+    """
+
+    if token is None:
+        value, age = "", "; max-age=0"
+    else:
+        value = token
+        age = f"; max-age={int(max_age)}" if max_age else ""
+
+    components.html(
+        f"""
+        <script>
+        (function () {{
+          try {{
+            var p = window.parent;
+            var secure = p.location.protocol === "https:"
+              ? "; Secure" : "";
+            p.document.cookie = "{AUTH_COOKIE_NAME}={value}"
+              + "; path=/; SameSite=Lax{age}" + secure;
+          }} catch (e) {{}}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+
+def _try_restore_session():
+    """Login otomatis dari cookie (dipanggil saat belum login)."""
+
+    if st.session_state.get("auth_logged_out"):
+        return
+
+    token = _read_auth_cookie()
+
+    if not token:
+        return
+
+    db = _load_auth_db()
+
+    result = _verify_auth_token(db, token)
+
+    if not result:
+        return
+
+    username, role, display_name, remember = result
+
+    st.session_state.auth_username = username
+    st.session_state.auth_role = role
+    st.session_state.auth_display_name = display_name
+    st.session_state.auth_remember = remember
+
+
+def _reissue_auth_cookie(db, username, role):
+    """Dipakai setelah ganti password, supaya sesi ini tidak putus."""
+
+    remember = bool(st.session_state.get("auth_remember", False))
+
+    _render_cookie_js(
+        _make_auth_token(db, username, role, remember),
+        AUTH_REMEMBER_SECONDS if remember else None,
+    )
 
 
 def _now_text():
@@ -5059,8 +5508,18 @@ def _set_security_question(
 
 
 def _do_logout():
-    for key in ("auth_username", "auth_role", "auth_display_name"):
+    for key in (
+        "auth_username",
+        "auth_role",
+        "auth_display_name",
+        "auth_remember",
+        "auth_pending_cookie",
+    ):
         st.session_state.pop(key, None)
+
+    # Cookie dihapus di halaman login (lihat _render_login_page);
+    # flag ini juga mencegah login otomatis dari cookie lama.
+    st.session_state.auth_logged_out = True
 
 
 def _goto_view(view):
@@ -5096,9 +5555,10 @@ def _render_login_view(db):
         "Ingat saya",
         key="login_remember",
         help=(
-            "Catatan: sesi tetap berakhir kalau tab "
-            "browser ditutup -- ini hanya preferensi "
-            "tampilan, bukan sesi 30 hari sungguhan."
+            "Dicentang: tetap login sampai 30 hari di "
+            "perangkat ini. Tidak dicentang: tetap login "
+            "saat halaman direfresh, tapi berakhir kalau "
+            "browser ditutup (maks. 12 jam)."
         ),
     )
 
@@ -5126,11 +5586,19 @@ def _render_login_view(db):
         )
 
         if ok:
-            st.session_state.auth_username = (
-                username.strip().lower()
+            uname = username.strip().lower()
+            remember = bool(
+                st.session_state.get("login_remember", False)
             )
+
+            st.session_state.auth_username = uname
             st.session_state.auth_role = role
             st.session_state.auth_display_name = display_name
+            st.session_state.auth_remember = remember
+            st.session_state.auth_pending_cookie = _make_auth_token(
+                db, uname, role, remember
+            )
+            st.session_state.pop("auth_logged_out", None)
             st.rerun()
         else:
             st.error(err)
@@ -5341,6 +5809,9 @@ def _render_forgot_view(db):
 
 def _render_login_page():
 
+    if st.session_state.get("auth_logged_out"):
+        _render_cookie_js(None, None)
+
     col_l, col_c, col_r = st.columns([1, 1.3, 1])
 
     with col_c:
@@ -5394,6 +5865,18 @@ def _render_admin_panel():
         + (f" ({len(pending)} menunggu)" if pending else ""),
         expanded=bool(pending),
     ):
+
+        if _remote_cfg():
+            st.caption(
+                "✅ Data akun tersimpan permanen di database."
+            )
+        else:
+            st.warning(
+                "Data akun masih disimpan di file lokal "
+                "(auth_users.json) dan bisa hilang saat app "
+                "reboot/redeploy. Isi SUPABASE_URL dan "
+                "SUPABASE_KEY di Secrets agar permanen."
+            )
 
         tab_pending, tab_active, tab_other = st.tabs(
             ["Menunggu", "Aktif", "Nonaktif/Ditolak"]
@@ -5616,6 +6099,37 @@ def _render_admin_panel():
             use_container_width=True,
         )
 
+        backup_file = st.file_uploader(
+            "Pulihkan dari backup (JSON)",
+            type=["json"],
+            key="auth_restore_file",
+        )
+
+        if backup_file is not None and st.button(
+            "♻️ Pulihkan Data User",
+            key="auth_restore_btn",
+            use_container_width=True,
+            help="Menimpa SEMUA data akun saat ini.",
+        ):
+            try:
+                restored = json.loads(
+                    backup_file.getvalue().decode("utf-8")
+                )
+            except Exception:
+                restored = None
+
+            if not _valid_auth_db(restored):
+                st.error("File backup tidak valid.")
+            else:
+                if not restored.get("cookie_secret"):
+                    restored["cookie_secret"] = os.urandom(
+                        32
+                    ).hex()
+                _save_auth_db(restored)
+                st.success(
+                    "Data user dipulihkan. Muat ulang halaman."
+                )
+
 
 def _render_change_password_self():
     """
@@ -5673,6 +6187,11 @@ def _render_change_password_self():
                 record["salt"] = salt_hex
                 record["hash"] = digest
                 _save_auth_db(db)
+                _reissue_auth_cookie(
+                    db,
+                    username,
+                    "admin" if kind == "admin" else "user",
+                )
                 st.success("Password berhasil diganti.")
 
         st.markdown("---")
@@ -5734,8 +6253,21 @@ def _render_change_password_self():
 
 
 if "auth_username" not in st.session_state:
+    _try_restore_session()
+
+if "auth_username" not in st.session_state:
     _render_login_page()
     st.stop()
+
+_pending_cookie = st.session_state.pop("auth_pending_cookie", None)
+
+if _pending_cookie:
+    _render_cookie_js(
+        _pending_cookie,
+        AUTH_REMEMBER_SECONDS
+        if st.session_state.get("auth_remember")
+        else None,
+    )
 
 
 with st.sidebar:
