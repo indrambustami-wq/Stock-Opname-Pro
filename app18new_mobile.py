@@ -14,6 +14,7 @@ from html import escape as html_escape
 import pandas as pd
 import requests
 import streamlit as st
+from urllib.parse import urlparse
 import streamlit.components.v1 as components
 
 from openpyxl import Workbook
@@ -4892,8 +4893,19 @@ def _remote_cfg():
     key = _secret("SUPABASE_KEY")
 
     if base and key:
+        base = base.strip().strip("\"'")
+        key = key.strip().strip("\"'")
+
+        if "://" not in base:
+            base = "https://" + base
+
+        # Ambil alamat dasarnya saja (https://xxxx.supabase.co),
+        # buang path tambahan seperti /rest/v1 atau /dashboard/...
+        parsed = urlparse(base)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+
         return (
-            base.rstrip("/") + "/rest/v1/" + AUTH_REMOTE_TABLE,
+            base + "/rest/v1/" + AUTH_REMOTE_TABLE,
             key,
         )
 
