@@ -4931,6 +4931,47 @@ def _remote_headers(key, extra=None):
     return headers
 
 
+def _conn_error_text(exc, url):
+    """Pesan error koneksi yang membantu diagnosis (tanpa key)."""
+
+    host = urlparse(url).netloc
+    raw = str(exc).lower()
+
+    if any(
+        t in raw
+        for t in (
+            "nameresolution",
+            "name or service not known",
+            "getaddrinfo",
+            "failed to resolve",
+            "nodename nor servname",
+            "temporary failure in name resolution",
+        )
+    ):
+        hint = (
+            "Nama host tidak ditemukan. Periksa SUPABASE_URL di "
+            "Secrets: salin persis dari Supabase (Settings > "
+            "Data API > Project URL), jangan diketik ulang."
+        )
+    elif "timed out" in raw or "timeout" in raw:
+        hint = (
+            "Koneksi time out. Server Supabase tidak menjawab; "
+            "cek apakah project sedang di-pause atau jaringan "
+            "tempat aplikasi berjalan memblokir supabase.co."
+        )
+    else:
+        hint = (
+            "Host ditemukan tapi koneksi ditolak/terputus. Cek "
+            "firewall/proxy jaringan tempat aplikasi berjalan "
+            "dan status project di dashboard Supabase."
+        )
+
+    return (
+        f"Tidak bisa terhubung ke database di {host} "
+        f"({exc.__class__.__name__}). {hint}"
+    )
+
+
 @st.cache_data(ttl=AUTH_CACHE_TTL, show_spinner=False)
 def _remote_read_cached(url, key):
     """Return dict data akun, atau None kalau barisnya belum ada."""
@@ -4946,9 +4987,7 @@ def _remote_read_cached(url, key):
             timeout=10,
         )
     except requests.RequestException as exc:
-        raise AuthStorageError(
-            f"Tidak bisa terhubung ke database ({exc.__class__.__name__})."
-        )
+        raise AuthStorageError(_conn_error_text(exc, url))
 
     if resp.status_code != 200:
         raise AuthStorageError(
@@ -4986,9 +5025,7 @@ def _remote_write(url, key, db):
             timeout=10,
         )
     except requests.RequestException as exc:
-        raise AuthStorageError(
-            f"Tidak bisa terhubung ke database ({exc.__class__.__name__})."
-        )
+        raise AuthStorageError(_conn_error_text(exc, url))
 
     if resp.status_code not in (200, 201, 204):
         raise AuthStorageError(
