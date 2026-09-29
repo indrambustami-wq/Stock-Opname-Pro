@@ -6,6 +6,7 @@ import json
 import os
 import re
 import secrets as pysecrets
+import tempfile
 import time
 import warnings
 from datetime import datetime
@@ -57,9 +58,11 @@ st.markdown(
     /* ========================================================
        STOCK OPNAME PRO - MOBILE FIRST UI
        ======================================================== */
-    /* iframe 0px pembawa script cookie login: jangan ikut menambah jarak */
+    /* komponen 0px penyimpan sesi login: jangan ikut menambah jarak */
     div[data-testid="stElementContainer"]:has(iframe[height="0"]),
-    .element-container:has(iframe[height="0"]) {
+    div[data-testid="stElementContainer"]:has(iframe[title*="aksa_auth_storage"]),
+    .element-container:has(iframe[height="0"]),
+    .element-container:has(iframe[title*="aksa_auth_storage"]) {
         position: absolute !important;
         width: 0 !important;
         height: 0 !important;
@@ -4793,15 +4796,18 @@ def create_berita_acara_docx(
 #
 # LOGIN OTOMATIS (refresh / "Ingat saya")
 # ---------------------------------------
-# Setelah login, browser menyimpan cookie "aksa_auth" berisi token
-# bertanda tangan (HMAC). Saat halaman direfresh, token itu dicek
-# dan user langsung masuk tanpa login ulang.
-#   - "Ingat saya" dicentang     : berlaku 30 hari.
-#   - "Ingat saya" tidak dicentang: berlaku sampai browser ditutup
-#                                   (maks. 12 jam).
-# Token otomatis tidak berlaku lagi kalau password diganti atau
-# akun dinonaktifkan. Logout menghapus cookie. Butuh Streamlit
-# >= 1.37 (st.context.cookies).
+# Setelah login, browser menyimpan token bertanda tangan (HMAC) di
+# penyimpanan browser (localStorage / sessionStorage) lewat komponen
+# kecil tak terlihat. Saat halaman direfresh, token itu dibaca lagi,
+# dicek server, dan user langsung masuk tanpa login ulang.
+#   - "Ingat saya" dicentang     : disimpan di localStorage, 30 hari.
+#   - "Ingat saya" tidak dicentang: disimpan di sessionStorage; tetap
+#                                   login saat refresh, berakhir kalau
+#                                   tab ditutup (maks. 12 jam).
+# Token otomatis tidak berlaku lagi kalau password diganti atau akun
+# dinonaktifkan. Logout menghapus token dari browser.
+# (Sengaja tidak memakai cookie: di Streamlit Cloud cookie yang dibaca
+# server tidak selalu ikut terkirim.)
 
 AUTH_DB_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -4812,7 +4818,6 @@ AUTH_REMOTE_TABLE = "auth_store"
 AUTH_REMOTE_ROW_ID = 1
 AUTH_CACHE_TTL = 5  # detik, cache baca database supaya tidak lambat
 
-AUTH_COOKIE_NAME = "aksa_auth"
 AUTH_REMEMBER_SECONDS = 30 * 24 * 3600
 AUTH_SESSION_SECONDS = 12 * 3600
 
@@ -5190,7 +5195,7 @@ def _save_auth_db(db):
 
 
 # ------------------------------------------------------------
-# Token login (cookie) -- supaya refresh / "Ingat saya" berfungsi
+# Token login (disimpan di browser) -- supaya refresh / "Ingat saya" berfungsi
 # ------------------------------------------------------------
 
 def _b64e(raw):
@@ -5282,54 +5287,143 @@ def _verify_auth_token(db, token):
         return None
 
 
-def _read_auth_cookie():
+# Komponen dua arah (browser <-> server) berisi JavaScript kecil.
+# File index.html-nya ditulis otomatis ke folder temp saat dijalankan,
+# jadi tidak ada file tambahan yang harus di-upload.
+_AUTH_STORAGE_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head><body>
+<script>
+(function () {
+  var KEY = "aksa_auth";
+  var lastOp = "";
+  var lastSent = null;
+
+  function send(type, data) {
+    var msg = { isStreamlitMessage: true, type: type };
+    for (var k in data) { msg[k] = data[k]; }
+    window.parent.postMessage(msg, "*");
+  }
+
+  function readToken() {
+    var v = "";
+    try { v = window.localStorage.getItem(KEY) || ""; } catch (e) {}
+    if (!v) {
+      try { v = window.sessionStorage.getItem(KEY) || ""; } catch (e) {}
+    }
+    return v;
+  }
+
+  function applyOp(args) {
+    if (!args || !args.op || !args.op_id || args.op_id === lastOp) {
+      return;
+    }
+    lastOp = args.op_id;
+    try { window.localStorage.removeItem(KEY); } catch (e) {}
+    try { window.sessionStorage.removeItem(KEY); } catch (e) {}
+    if (args.op === "set" && args.token) {
+      try {
+        if (args.remember) {
+          window.localStorage.setItem(KEY, args.token);
+        } else {
+          window.sessionStorage.setItem(KEY, args.token);
+        }
+      } catch (e) {}
+    }
+  }
+
+  window.addEventListener("message", function (event) {
+    var d = event.data;
+    if (!d || d.type !== "streamlit:render") { return; }
+    applyOp(d.args);
+    var value = { token: readToken(), op_id: lastOp };
+    var enc = JSON.stringify(value);
+    if (enc !== lastSent) {
+      lastSent = enc;
+      send("streamlit:setComponentValue", {
+        value: value, dataType: "json"
+      });
+    }
+    send("streamlit:setFrameHeight", { height: 0 });
+  });
+
+  send("streamlit:componentReady", { apiVersion: 1 });
+  send("streamlit:setFrameHeight", { height: 0 });
+})();
+</script>
+</body></html>
+"""
+
+
+def _get_storage_component():
+
+    folder = os.path.join(
+        tempfile.gettempdir(), "aksa_auth_storage_component"
+    )
+    os.makedirs(folder, exist_ok=True)
+
+    path = os.path.join(folder, "index.html")
 
     try:
-        return st.context.cookies.get(AUTH_COOKIE_NAME)
+        with open(path, "r", encoding="utf-8") as fh:
+            same = fh.read() == _AUTH_STORAGE_HTML
+    except OSError:
+        same = False
+
+    if not same:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(_AUTH_STORAGE_HTML)
+
+    return components.declare_component(
+        "aksa_auth_storage", path=folder
+    )
+
+
+def _auth_storage_sync():
+    """
+    Pasang komponen penyimpan sesi (harus dipanggil di SETIAP run,
+    supaya perintah simpan/hapus token ikut terkirim ke browser).
+    Return dict {"token": str, "op_id": str} setelah browser melapor,
+    atau None kalau belum melapor / komponen gagal dimuat.
+    """
+
+    op = st.session_state.get("auth_storage_op") or {}
+
+    try:
+        return _get_storage_component()(
+            op=op.get("op", ""),
+            token=op.get("token", ""),
+            remember=bool(op.get("remember", False)),
+            op_id=op.get("id", ""),
+            key="aksa_auth_storage",
+            default=None,
+        )
     except Exception:
         return None
 
 
-def _render_cookie_js(token, max_age):
-    """
-    Pasang / hapus cookie login di browser lewat iframe 0px.
-    token=None -> hapus cookie. max_age=None -> cookie sesi
-    (hilang saat browser ditutup).
-    """
+def _queue_storage_op(op, token="", remember=False):
+    """Antrikan perintah 'set' / 'clear' token untuk browser."""
 
-    if token is None:
-        value, age = "", "; max-age=0"
-    else:
-        value = token
-        age = f"; max-age={int(max_age)}" if max_age else ""
-
-    components.html(
-        f"""
-        <script>
-        (function () {{
-          try {{
-            var p = window.parent;
-            var secure = p.location.protocol === "https:"
-              ? "; Secure" : "";
-            p.document.cookie = "{AUTH_COOKIE_NAME}={value}"
-              + "; path=/; SameSite=Lax{age}" + secure;
-          }} catch (e) {{}}
-        }})();
-        </script>
-        """,
-        height=0,
-    )
+    st.session_state.auth_storage_op = {
+        "op": op,
+        "token": token,
+        "remember": bool(remember),
+        "id": pysecrets.token_hex(8),
+    }
 
 
-def _try_restore_session():
-    """Login otomatis dari cookie (dipanggil saat belum login)."""
+def _try_restore_session(stored):
+    """Login otomatis dari token di browser (saat belum login)."""
 
     if st.session_state.get("auth_logged_out"):
         return
 
-    token = _read_auth_cookie()
+    if not isinstance(stored, dict):
+        return
 
-    if not token:
+    token = stored.get("token")
+
+    if not token or not isinstance(token, str):
         return
 
     db = _load_auth_db()
@@ -5347,14 +5441,15 @@ def _try_restore_session():
     st.session_state.auth_remember = remember
 
 
-def _reissue_auth_cookie(db, username, role):
+def _reissue_auth_token(db, username, role):
     """Dipakai setelah ganti password, supaya sesi ini tidak putus."""
 
     remember = bool(st.session_state.get("auth_remember", False))
 
-    _render_cookie_js(
+    _queue_storage_op(
+        "set",
         _make_auth_token(db, username, role, remember),
-        AUTH_REMEMBER_SECONDS if remember else None,
+        remember,
     )
 
 
@@ -5562,12 +5657,12 @@ def _do_logout():
         "auth_role",
         "auth_display_name",
         "auth_remember",
-        "auth_pending_cookie",
     ):
         st.session_state.pop(key, None)
 
-    # Cookie dihapus di halaman login (lihat _render_login_page);
-    # flag ini juga mencegah login otomatis dari cookie lama.
+    # Hapus token di browser; flag ini juga mencegah login otomatis
+    # dari token lama selama perintah hapus belum sampai.
+    _queue_storage_op("clear")
     st.session_state.auth_logged_out = True
 
 
@@ -5607,7 +5702,7 @@ def _render_login_view(db):
             "Dicentang: tetap login sampai 30 hari di "
             "perangkat ini. Tidak dicentang: tetap login "
             "saat halaman direfresh, tapi berakhir kalau "
-            "browser ditutup (maks. 12 jam)."
+            "tab ditutup (maks. 12 jam)."
         ),
     )
 
@@ -5644,8 +5739,10 @@ def _render_login_view(db):
             st.session_state.auth_role = role
             st.session_state.auth_display_name = display_name
             st.session_state.auth_remember = remember
-            st.session_state.auth_pending_cookie = _make_auth_token(
-                db, uname, role, remember
+            _queue_storage_op(
+                "set",
+                _make_auth_token(db, uname, role, remember),
+                remember,
             )
             st.session_state.pop("auth_logged_out", None)
             st.rerun()
@@ -5857,9 +5954,6 @@ def _render_forgot_view(db):
 
 
 def _render_login_page():
-
-    if st.session_state.get("auth_logged_out"):
-        _render_cookie_js(None, None)
 
     col_l, col_c, col_r = st.columns([1, 1.3, 1])
 
@@ -6236,7 +6330,7 @@ def _render_change_password_self():
                 record["salt"] = salt_hex
                 record["hash"] = digest
                 _save_auth_db(db)
-                _reissue_auth_cookie(
+                _reissue_auth_token(
                     db,
                     username,
                     "admin" if kind == "admin" else "user",
@@ -6301,22 +6395,15 @@ def _render_change_password_self():
                 )
 
 
+# Komponen penyimpan sesi: dipasang di setiap run (tak terlihat).
+_auth_stored = _auth_storage_sync()
+
 if "auth_username" not in st.session_state:
-    _try_restore_session()
+    _try_restore_session(_auth_stored)
 
 if "auth_username" not in st.session_state:
     _render_login_page()
     st.stop()
-
-_pending_cookie = st.session_state.pop("auth_pending_cookie", None)
-
-if _pending_cookie:
-    _render_cookie_js(
-        _pending_cookie,
-        AUTH_REMEMBER_SECONDS
-        if st.session_state.get("auth_remember")
-        else None,
-    )
 
 
 with st.sidebar:
