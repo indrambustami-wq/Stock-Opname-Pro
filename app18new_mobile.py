@@ -303,6 +303,29 @@ CATEGORIES = [
     "PLUS",
 ]
 
+# Format khusus brand GAUDI (semua jenis laporan: SO Mandiri
+# dan SO IC): ada tambahan kategori UNIFORM (item yang
+# Golongan / Artikel-nya memuat kata "UNF", mis.
+# 2F20-UNF2-001), tepat setelah KLOP.
+#
+# UNIFORM TIDAK ikut perhitungan deduct. Deduct hanya dihitung
+# dari SHOPBAG + MINUS + PLUS (lihat bagian NOTE di Excel,
+# Berita Acara, dan email Final), jadi memindahkan item UNF ke
+# kategori sendiri otomatis mengeluarkannya dari deduct.
+CATEGORIES_GAUDI = [
+    "KLOP",
+    "UNIFORM",
+    "SHOPBAG",
+    "TERTUKAR",
+    "MINUS",
+    "PLUS",
+]
+
+# "UNF" sebagai kata/kode, bukan potongan di tengah kata lain
+# (mis. tidak ikut tertangkap di "SUNFLOWER"): tidak boleh
+# didahului huruf.
+UNIFORM_PATTERN = re.compile(r"(?<![A-Za-z])UNF", re.IGNORECASE)
+
 # ============================================================
 # MASTER LOKASI
 # ============================================================
@@ -1032,6 +1055,39 @@ LOCATION_NAMES = {
 }
 
 
+# Kode lokasi brand GAUDI (dari MASTER_LOKASI_GAUDI.xlsx).
+# Dipakai untuk mengenali brand Gaudi dari kolom Loc, supaya
+# format laporan khusus Gaudi (kategori UNIFORM) otomatis aktif.
+# Kalau ada lokasi Gaudi baru, tambahkan di sini dan di dict
+# LOCATION_INITIALS / LOCATION_NAMES.
+GAUDI_LOCATION_CODES = frozenset({
+    "B03", "B05", "B06", "B09", "B11", "B13", "B15", "B16", "B17",
+    "B18", "B22", "B23", "B24", "B26", "B27", "B30", "B32", "B33",
+    "B35", "B36", "B37", "B38", "B39", "B40", "B41", "B42", "B43",
+    "B44", "G01", "G02", "G03", "G04", "G05", "G06", "G07", "G08",
+    "G09", "G10", "G11", "G12", "G13", "G14", "G15", "G16", "G17",
+    "G18", "G19", "G20", "G21", "G22", "G24", "G25", "G26", "G27",
+    "G28", "G29", "G30", "G31", "G32", "G33", "G34", "G35", "G36",
+    "G37", "G38", "G39", "G40", "G41", "G42", "G43", "G44", "G45",
+    "G46", "G47", "G48", "G49", "G50", "G51", "G52", "G53", "G54",
+    "G55", "G56", "G57", "G58", "G59", "G60", "G61", "G62", "G63",
+    "G64", "G65", "G66", "GC08", "GC09", "GC10", "GC11", "GC12",
+    "GC13", "GC14", "GC15", "GC16", "GC17", "GC18", "GC20",
+    "GC21", "GC22", "GC23", "GC24", "GC25", "GC27", "GC28",
+    "GC29", "GC30", "GC31", "GC32", "GC41", "GT01", "H01", "H02",
+    "H03", "H29", "HB11", "HB12", "HB24", "HC01", "HC02", "HC03",
+    "HC04", "HC05", "HC06", "HC07", "HC08", "HC09", "HC10",
+    "HC11", "HC12", "HC13", "HC15", "HN01", "HN02", "HN03",
+    "HN04", "HN29", "HN80", "HO01", "HO02", "M07", "M08", "M09",
+    "MP01", "MP02", "MP03", "MP04", "MP05", "MP06", "MP07",
+    "MP08", "N01", "N02", "N03", "N04", "N05", "N06", "N07",
+    "N08", "N09", "N10", "N11", "N12", "N13", "N14", "N15", "N16",
+    "N17", "N18", "N19", "N20", "N21", "N22", "N23", "N34", "N37",
+    "N38", "N39", "N45", "N46", "N47", "N48", "N67", "N80", "N90",
+    "N99", "RJ1", "WH01",
+})
+
+
 def format_location_full(loc_code):
     """
     Format lokasi untuk Berita Acara: "NAMA LOKASI ( KODE )".
@@ -1638,10 +1694,47 @@ def is_shopbag(row):
     return False
 
 
-def categorize(df):
+def is_gaudi_df(df):
+    """True kalau data ini milik brand Gaudi (dilihat dari Loc)."""
+
+    if "Loc" not in df.columns or len(df) == 0:
+        return False
+
+    locs = df["Loc"].astype(str).str.strip()
+
+    return bool(locs.isin(GAUDI_LOCATION_CODES).mean() >= 0.5)
+
+
+def is_uniform(row):
+    """
+    UNIFORM (khusus Gaudi): Golongan atau Artikel (SKU)
+    memuat kata "UNF", mis. Artikel "2F20-UNF2-001" atau
+    Golongan "UNF".
+    """
+    return bool(
+        UNIFORM_PATTERN.search(str(row["Golongan"]))
+        or UNIFORM_PATTERN.search(str(row["Artikel"]))
+    )
+
+
+def get_categories(df):
+    """
+    Daftar kategori yang dipakai untuk data ini. Brand Gaudi
+    (dikenali dari Loc) memakai CATEGORIES_GAUDI (ada UNIFORM)
+    di semua jenis laporan; brand lain memakai CATEGORIES.
+    """
+    if is_gaudi_df(df):
+        return CATEGORIES_GAUDI
+
+    return CATEGORIES
+
+
+def categorize(df, uniform=False):
     """
     Prioritas:
 
+    0. UNIFORM  (hanya kalau uniform=True, format Gaudi;
+       tidak ikut deduct)
     1. SHOPBAG
     2. TERTUKAR
     3. MINUS
@@ -1651,6 +1744,23 @@ def categorize(df):
     df = df.copy()
 
     df["Kategori"] = ""
+
+    # ========================================================
+    # 0. UNIFORM (khusus Gaudi) -- sebelum SHOPBAG karena
+    #    keyword SHOPBAG ("SB", "LB", "Bag", ...) cukup longgar
+    #    dan bisa ikut menangkap kode SKU uniform.
+    # ========================================================
+
+    if uniform and len(df):
+        uniform_mask = df.apply(
+            is_uniform,
+            axis=1,
+        )
+
+        df.loc[
+            uniform_mask,
+            "Kategori",
+        ] = "UNIFORM"
 
     # ========================================================
     # 1. SHOPBAG
@@ -1758,7 +1868,7 @@ def categorize(df):
         category = row["Kategori"]
         selisih = row["Selisih"]
 
-        if category == "SHOPBAG":
+        if category in ("SHOPBAG", "UNIFORM"):
             if selisih < 0:
                 return "Minus"
 
@@ -1781,10 +1891,10 @@ def categorize(df):
 # SUMMARY
 # ============================================================
 
-def create_summary(df):
+def create_summary(df, categories=None):
     rows = []
 
-    for category in CATEGORIES:
+    for category in (categories or CATEGORIES):
         part = df[
             df["Kategori"]
             == category
@@ -2056,6 +2166,7 @@ def style_detail_header(
 def compute_category_layout(
     df,
     start_row=9,
+    categories=None,
 ):
     """
     Hitung posisi baris (data_start_row, data_end_row,
@@ -2070,7 +2181,7 @@ def compute_category_layout(
 
     row_cursor = start_row
 
-    for category in CATEGORIES:
+    for category in (categories or CATEGORIES):
 
         part_len = len(
             df[
@@ -2120,6 +2231,7 @@ def create_final_excel(
     compensation_note="",
     include_hm=True,
     report_stage=None,
+    categories=None,
 ):
     """
     Membuat workbook FINAL.
@@ -2138,6 +2250,8 @@ def create_final_excel(
                           NOTE/PERHITUNGAN DEDUCT dihilangkan
                           sepenuhnya (bukan cuma disembunyikan).
     """
+
+    categories = categories or CATEGORIES
 
     # Daftar kolom detail yang benar-benar dipakai di
     # workbook ini (dipakai untuk semua indeks kolom di
@@ -2198,7 +2312,8 @@ def create_final_excel(
     # di awal, sebelum ditulis), dipakai supaya tabel
     # summary di atas bisa merujuk via rumus.
     category_layout = compute_category_layout(
-        df
+        df,
+        categories=categories,
     )
 
     # Huruf kolom Excel untuk setiap nama kolom di
@@ -2353,7 +2468,7 @@ def create_final_excel(
     summary_row_start = 2
     summary_row_end = (
         summary_row_start
-        + len(CATEGORIES)
+        + len(categories)
         - 1
     )
 
@@ -2543,7 +2658,7 @@ def create_final_excel(
 
     current_row = 9
 
-    for category in CATEGORIES:
+    for category in categories:
 
         part = df[
             df["Kategori"]
@@ -6909,14 +7024,14 @@ with st.sidebar:
             min_value=0.0,
             max_value=100.0,
             value=30.0,
-            step=1.0,
+            step=10.0,
             format="%.2f",
         )
 
         compensation = st.number_input(
             "Nilai Kompensasi (Rp)",
             min_value=0.0,
-            value=500_000.0,
+            value=0.0,
             step=50_000.0,
             format="%.0f",
         )
@@ -7162,12 +7277,20 @@ try:
         df_raw
     )
 
+    # Format khusus Gaudi (kategori UNIFORM, tidak ikut
+    # deduct); brand dikenali dari kode Loc.
+    categories = get_categories(
+        df,
+    )
+
     df = categorize(
-        df
+        df,
+        uniform=("UNIFORM" in categories),
     )
 
     summary = create_summary(
-        df
+        df,
+        categories,
     )
 
     metadata = get_metadata(
@@ -7378,13 +7501,13 @@ with st.expander(
                 f"{category} "
                 f"({len(df[df['Kategori'] == category])})"
             )
-            for category in CATEGORIES
+            for category in categories
         ]
     )
 
     for tab, category in zip(
         tabs,
-        CATEGORIES,
+        categories,
     ):
 
         with tab:
@@ -7668,6 +7791,7 @@ try:
         ),
         include_hm=is_final,
         report_stage=so_stage,
+        categories=categories,
     )
 
     file_prefix = (
