@@ -1132,8 +1132,8 @@ COLUMN_ALIASES = {
 
 DETAIL_COLUMNS = [
     "Barcode",
-    "Artikel",
     "Golongan",
+    "Artikel",
     "Price",
     "Qty Fisik",
     "Qty POS",
@@ -2273,6 +2273,19 @@ def create_final_excel(
 
     if report_stage is None:
         report_stage = "Final" if include_hm else "Mandiri"
+
+    # Format khusus Gaudi untuk laporan SEMENTARA: kolom Total HM
+    # disembunyikan (datanya tetap ada karena dipakai rumus NOTE /
+    # deduct).
+    #
+    # Urutan kolom detail (Barcode, Golongan, Artikel, Price, ...)
+    # diatur di DETAIL_COLUMNS dan berlaku untuk semua laporan.
+    # Semua rumus memakai nama kolom (col_letter), jadi urutan
+    # kolom boleh berubah tanpa mengubah perhitungan deduct.
+    gaudi_sementara = (
+        report_stage == "Sementara"
+        and is_gaudi_df(df)
+    )
 
     stage_titles = {
         "Sementara": (
@@ -3643,6 +3656,14 @@ def create_final_excel(
     if include_hm and "HM" in col_letter:
         ws.column_dimensions[
             col_letter["HM"]
+        ].hidden = True
+
+    # Gaudi + Sementara: Total HM (di tabel summary dan tabel
+    # detail) juga disembunyikan. Kolom NOTE / deduct (di kolom
+    # A-C) tidak terpengaruh.
+    if gaudi_sementara and "Total HM" in col_letter:
+        ws.column_dimensions[
+            col_letter["Total HM"]
         ].hidden = True
 
     # --------------------------------------------------------
@@ -7519,8 +7540,8 @@ with st.expander(
 
             display_columns = [
                 "Barcode",
-                "Artikel",
                 "Golongan",
+                "Artikel",
                 "Price",
                 "Qty Fisik",
                 "Qty POS",
