@@ -1729,6 +1729,293 @@ def get_categories(df):
     return CATEGORIES
 
 
+def barcode_number(barcode):
+    """Angka di dalam barcode (mis. H00000038287 -> 38287)."""
+
+    digits = re.sub(r"\D", "", str(barcode))
+
+    return int(digits) if digits else None
+
+
+# Batas target untuk pencarian "satu baris ditutup beberapa baris"
+# (supaya pencarian tetap cepat pada data yang tidak biasa).
+MAX_COVER_TARGET = 500
+
+
+def min_distance_cover(target, items):
+    """
+    Dari items = [(index, bobot, jarak), ...] pilih sebagian yang
+    jumlah bobotnya PERSIS sama dengan target, dengan total jarak
+    barcode paling kecil.
+
+    Return: list index yang dipilih, atau None kalau tidak ada
+    kombinasi yang pas.
+    """
+
+    n = len(items)
+
+    inf = float("inf")
+
+    table = [
+        [inf] * (target + 1)
+        for _ in range(n + 1)
+    ]
+
+    table[0][0] = 0
+
+    for i in range(1, n + 1):
+        _, weight, dist = items[i - 1]
+
+        for j in range(target + 1):
+            best = table[i - 1][j]
+
+            if j >= weight:
+                taken = table[i - 1][j - weight] + dist
+
+                if taken < best:
+                    best = taken
+
+            table[i][j] = best
+
+    if table[n][target] == inf:
+        return None
+
+    chosen = []
+
+    j = target
+
+    for i in range(n, 0, -1):
+        if table[i][j] != table[i - 1][j]:
+            idx, weight, _ = items[i - 1]
+
+            chosen.append(idx)
+
+            j -= weight
+
+    return chosen
+
+
+def _is_whole_number(value):
+    return abs(value - round(value)) < 1e-9
+
+
+def cover_rows_with_several(group, used):
+    """
+    Langkah 2 TERTUKAR SEBAGIAN: satu baris selisih besar
+    (mis. -3) ditutup oleh beberapa baris berlawanan yang
+    jumlahnya PERSIS sama (mis. tiga baris +1). Baris tetap utuh,
+    tidak dipecah. Berlaku dua arah (minus ditutup plus, atau
+    plus ditutup minus).
+
+    Urutan: baris dengan selisih terbesar dulu; kalau sama besar,
+    yang total jarak barcode-nya paling dekat.
+
+    `used` diisi index baris yang terpakai. Return: index baris
+    yang masuk TERTUKAR.
+    """
+
+    far = 10 ** 12
+
+    paired = []
+
+    while True:
+        best = None
+
+        for b_idx, b_row in group.iterrows():
+            if b_idx in used:
+                continue
+
+            b_sel = b_row["Selisih"]
+
+            if not _is_whole_number(b_sel):
+                continue
+
+            magnitude = int(round(abs(b_sel)))
+
+            if magnitude < 2 or magnitude > MAX_COVER_TARGET:
+                continue
+
+            b_num = barcode_number(b_row["Barcode"])
+
+            items = []
+
+            available = 0
+
+            for o_idx, o_row in group.iterrows():
+                if o_idx in used or o_idx == b_idx:
+                    continue
+
+                o_sel = o_row["Selisih"]
+
+                # harus berlawanan tanda dan bilangan bulat
+                if o_sel * b_sel >= 0:
+                    continue
+
+                if not _is_whole_number(o_sel):
+                    continue
+
+                weight = int(round(abs(o_sel)))
+
+                if weight >= magnitude:
+                    continue
+
+                o_num = barcode_number(o_row["Barcode"])
+
+                dist = (
+                    abs(b_num - o_num)
+                    if b_num is not None and o_num is not None
+                    else far
+                )
+
+                items.append((o_idx, weight, dist))
+
+                available += weight
+
+            if available < magnitude:
+                continue
+
+            items.sort(key=lambda it: (it[2], str(it[0])))
+
+            chosen = min_distance_cover(magnitude, items)
+
+            if chosen is None:
+                continue
+
+            dist_by_idx = {it[0]: it[2] for it in items}
+
+            cost = sum(dist_by_idx[c] for c in chosen)
+
+            key = (-magnitude, cost, str(b_idx))
+
+            if best is None or key < best[0]:
+                best = (key, b_idx, chosen)
+
+        if best is None:
+            break
+
+        _, b_idx, chosen = best
+
+        used.add(b_idx)
+
+        used.update(chosen)
+
+        paired.append(b_idx)
+
+        paired.extend(chosen)
+
+    return paired
+
+
+def find_exchanged_pairs(df):
+    """
+    TERTUKAR SEBAGIAN.
+
+    Dalam satu Artikel yang total selisihnya TIDAK 0, kadang ada
+    baris minus dan baris plus yang saling menutup -- barcode-nya
+    tertukar, sisanya baru selisih sungguhan. Fungsi ini
+    memasangkan baris-baris itu, dalam dua langkah:
+
+      1. Pasangan sama besar: baris minus dan plus yang nilainya
+         persis berlawanan (-1 dengan +1, -2 dengan +2, dst.).
+         Kalau ada beberapa kandidat, dipilih barcode yang
+         nomornya paling dekat (mis. ...38287 dengan ...38286).
+
+      2. Satu baris ditutup beberapa baris: baris selisih besar
+         (mis. -3) ditutup beberapa baris berlawanan yang
+         jumlahnya persis sama (mis. tiga baris +1); berlaku dua
+         arah. Lihat cover_rows_with_several.
+
+    Aturan umum:
+      - hanya Artikel yang SAMA PERSIS dan baris yang belum
+        punya kategori (bukan SHOPBAG / UNIFORM / TERTUKAR),
+      - baris selalu utuh, tidak dipecah,
+      - sisa baris yang tidak berpasangan tetap MINUS / PLUS.
+
+    Return: daftar index baris yang masuk TERTUKAR.
+    """
+
+    candidates = df[
+        (df["Kategori"] == "")
+        & (df["Selisih"] != 0)
+    ]
+
+    has_minus = set(
+        candidates.loc[
+            candidates["Selisih"] < 0,
+            "Artikel",
+        ]
+    )
+
+    has_plus = set(
+        candidates.loc[
+            candidates["Selisih"] > 0,
+            "Artikel",
+        ]
+    )
+
+    both_signs = has_minus & has_plus
+
+    if not both_signs:
+        return []
+
+    far = float("inf")
+
+    paired_index = []
+
+    for artikel, group in candidates[
+        candidates["Artikel"].isin(both_signs)
+    ].groupby("Artikel"):
+
+        minus_rows = group[group["Selisih"] < 0]
+        plus_rows = group[group["Selisih"] > 0]
+
+        used = set()
+
+        # ---- Langkah 1: pasangan sama besar ----
+
+        options = []
+
+        for m_idx, m_row in minus_rows.iterrows():
+            m_num = barcode_number(m_row["Barcode"])
+
+            for p_idx, p_row in plus_rows.iterrows():
+                if abs(m_row["Selisih"] + p_row["Selisih"]) > 1e-6:
+                    continue
+
+                p_num = barcode_number(p_row["Barcode"])
+
+                distance = (
+                    abs(m_num - p_num)
+                    if m_num is not None and p_num is not None
+                    else far
+                )
+
+                options.append(
+                    (distance, m_idx, p_idx)
+                )
+
+        options.sort(
+            key=lambda o: (o[0], str(o[1]), str(o[2]))
+        )
+
+        for _, m_idx, p_idx in options:
+            if m_idx in used or p_idx in used:
+                continue
+
+            used.add(m_idx)
+            used.add(p_idx)
+
+            paired_index.extend([m_idx, p_idx])
+
+        # ---- Langkah 2: satu baris ditutup beberapa baris ----
+
+        paired_index.extend(
+            cover_rows_with_several(group, used)
+        )
+
+    return paired_index
+
+
 def categorize(df, uniform=False):
     """
     Prioritas:
@@ -1736,7 +2023,10 @@ def categorize(df, uniform=False):
     0. UNIFORM  (hanya kalau uniform=True, format Gaudi;
        tidak ikut deduct)
     1. SHOPBAG
-    2. TERTUKAR
+    2. TERTUKAR (total selisih satu Artikel = 0, atau
+       baris minus/plus yang saling menutup dalam satu
+       Artikel: pasangan sama besar, atau satu baris ditutup
+       beberapa baris; lihat find_exchanged_pairs)
     3. MINUS
     4. PLUS
     5. KLOP
@@ -1814,6 +2104,18 @@ def categorize(df, uniform=False):
         tertukar_mask,
         "Kategori",
     ] = "TERTUKAR"
+
+    # Tertukar sebagian: baris minus/plus yang saling menutup
+    # dalam satu Artikel yang total selisihnya tidak 0 (pasangan
+    # sama besar, atau satu baris ditutup beberapa baris).
+    # Sisa baris yang tidak berpasangan tetap MINUS / PLUS.
+    paired_index = find_exchanged_pairs(df)
+
+    if paired_index:
+        df.loc[
+            paired_index,
+            "Kategori",
+        ] = "TERTUKAR"
 
     # ========================================================
     # 3. MINUS
