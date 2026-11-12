@@ -1,4 +1,5 @@
 import base64
+import csv
 import hashlib
 import hmac
 import io
@@ -18,7 +19,8 @@ import streamlit as st
 from urllib.parse import urlparse
 import streamlit.components.v1 as components
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import (
     Font,
     PatternFill,
@@ -7227,6 +7229,824 @@ def _render_change_password_self():
                 )
 
 
+# ---- KONSOLIDASI EXCEL: MULAI ----
+# ============================================================
+# KONSOLIDASI EXCEL
+# Gabungkan data scan dari banyak file Excel & banyak sheet
+# menjadi satu (REKAP SHEET + PIVOT). Logika pembacaan sheet
+# mengikuti excel_multi_file_sheet_consolidator.html.
+#
+# Format sheet yang dikenali:
+#   - 1 kolom  : Barcode (QTY otomatis 1)
+#   - 2 kolom  : Barcode + QTY, atau Barcode + KOLI/KET (teks
+#                di kolom 2 menjadi KET untuk baris-baris di
+#                bawahnya)
+#   - berpasangan multi-kolom: baris 1 berisi nama lokasi,
+#     mis. WALL 1 | QTY | WALL 2 | QTY
+# ============================================================
+
+CONSOL_SKIP_SHEET = re.compile(
+    r"^(TOTAL|REKAP|REKAP SHEET|PIVOT)$", re.IGNORECASE
+)
+CONSOL_SKIP_ORIGINAL = re.compile(
+    r"^(REKAP SHEET|PIVOT)$", re.IGNORECASE
+)
+CONSOL_SKIP_WORDS_MULTI = re.compile(
+    r"^(TOTAL|BARCODE|KODE)$", re.IGNORECASE
+)
+CONSOL_SKIP_WORDS_SINGLE = re.compile(
+    r"^(BARCODE|KODE|ITEM|TOTAL)$", re.IGNORECASE
+)
+CONSOL_NUMBER = re.compile(
+    r"^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$"
+)
+CONSOL_PREVIEW_ROWS = 500
+CONSOL_REKAP_HEADER = ["BARCODE", "COUNT", "KET", "SHEET", "FILE"]
+CONSOL_EXCEL_NAME = "HASIL_REKAP_GABUNGAN_SO.xlsx"
+CONSOL_CSV_NAME = "REKAP_SHEET_GABUNGAN.csv"
+
+
+def consol_cell_text(value):
+    """Isi sel sebagai teks (angka bulat tanpa '.0' / notasi ilmiah)."""
+
+    if value is None:
+        return ""
+
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+
+    if isinstance(value, int):
+        return str(value)
+
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            return ""
+
+        if value == int(value) and abs(value) < 1e15:
+            return str(int(value))
+
+        return "%.15g" % value
+
+    if isinstance(value, datetime):
+        return value.isoformat(sep=" ")
+
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+
+    return str(value)
+
+
+def consol_parse_number(text):
+    """Angka dari teks (koma dianggap desimal); None kalau bukan angka."""
+
+    cleaned = str(text).replace(",", ".").strip()
+
+    if not CONSOL_NUMBER.match(cleaned):
+        return None
+
+    try:
+        number = float(cleaned)
+    except ValueError:
+        return None
+
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+
+    return number
+
+
+def consol_trim_rows(rows):
+    """
+    Buang baris kosong di atas/bawah dan kolom kosong di kiri/kanan,
+    lalu ratakan lebar semua baris. Hasilnya: daftar baris dengan
+    sel pertama = sel terisi pertama di sheet.
+    """
+
+    def filled(value):
+        return value is not None and value != ""
+
+    first = None
+    last = None
+    min_col = None
+    max_col = None
+
+    for i, row in enumerate(rows):
+        cols = [j for j, v in enumerate(row) if filled(v)]
+
+        if not cols:
+            continue
+
+        if first is None:
+            first = i
+
+        last = i
+
+        min_col = (
+            cols[0] if min_col is None else min(min_col, cols[0])
+        )
+
+        max_col = (
+            cols[-1] if max_col is None else max(max_col, cols[-1])
+        )
+
+    if first is None:
+        return []
+
+    width = max_col - min_col + 1
+
+    trimmed = []
+
+    for row in rows[first:last + 1]:
+        part = list(row[min_col:max_col + 1])
+
+        if len(part) < width:
+            part.extend([None] * (width - len(part)))
+
+        trimmed.append(part)
+
+    return trimmed
+
+
+def consol_extract_sheet(
+    rows,
+    sheet_name,
+    file_label,
+    default_one=True,
+):
+    """
+    Ubah satu sheet menjadi daftar record
+    (BARCODE, COUNT, KET, SHEET, FILE).
+
+    Return: (records, has_data)
+    """
+
+    records = []
+
+    if not rows:
+        return records, False
+
+    first_row = rows[0]
+
+    width = len(first_row)
+
+    def text(row, col):
+        if col < len(row):
+            return consol_cell_text(row[col]).strip()
+
+        return ""
+
+    headers = [text(first_row, i) for i in range(width)]
+
+    filled_headers = [h for h in headers if h != ""]
+
+    is_multi_pair = width >= 3 and len(filled_headers) >= 2
+
+    empty_qty = 1 if default_one else 0
+
+    has_data = False
+
+    if is_multi_pair:
+        # Layout berpasangan: WALL 1 | QTY | WALL 2 | QTY ...
+        c = 0
+
+        while c < width:
+            location = headers[c]
+
+            if not location:
+                c += 1
+                continue
+
+            has_data = True
+
+            for r in range(1, len(rows)):
+                row = rows[r]
+
+                barcode = text(row, c)
+                qty_raw = text(row, c + 1)
+
+                if not barcode or CONSOL_SKIP_WORDS_MULTI.match(
+                    barcode
+                ):
+                    continue
+
+                if qty_raw == "":
+                    qty = empty_qty
+                else:
+                    parsed = consol_parse_number(qty_raw)
+
+                    qty = (
+                        parsed
+                        if parsed is not None and parsed > 0
+                        else empty_qty
+                    )
+
+                if qty <= 0:
+                    continue
+
+                records.append(
+                    (barcode, qty, location, sheet_name, file_label)
+                )
+
+            c += 2  # lewati kolom QTY pasangannya
+
+    else:
+        # Format 1 kolom atau 2 kolom
+        active_ket = sheet_name
+
+        for row in rows:
+            col0 = text(row, 0)
+            col1 = text(row, 1)
+
+            if not col0 or CONSOL_SKIP_WORDS_SINGLE.match(col0):
+                continue
+
+            has_data = True
+
+            qty = 1
+
+            if col1 != "":
+                parsed = consol_parse_number(col1)
+
+                if (
+                    parsed is not None
+                    and parsed > 0
+                    and not re.search(r"[A-Za-z]", col1)
+                ):
+                    qty = parsed
+                else:
+                    # Kolom 2 berisi teks grup / keterangan
+                    # (mis. KOLI 1) -> berlaku untuk baris di bawahnya
+                    active_ket = col1
+                    qty = empty_qty
+            else:
+                qty = empty_qty
+
+            if qty <= 0:
+                continue
+
+            records.append(
+                (col0, qty, active_ket, sheet_name, file_label)
+            )
+
+    return records, has_data
+
+
+def consol_read_workbook(file_name, data):
+    """
+    Baca semua sheet satu file Excel.
+    Return: [(nama_sheet, baris)] dengan baris = list nilai sel asli
+    (mulai dari A1).
+    """
+
+    extension = file_name.lower().rsplit(".", 1)[-1]
+
+    sheets = []
+
+    if extension in ("xlsx", "xlsm"):
+        workbook = load_workbook(
+            io.BytesIO(data),
+            read_only=True,
+            data_only=True,
+        )
+
+        try:
+            for worksheet in workbook.worksheets:
+                rows = [
+                    list(row)
+                    for row in worksheet.iter_rows(values_only=True)
+                ]
+
+                sheets.append((worksheet.title, rows))
+        finally:
+            workbook.close()
+
+        return sheets
+
+    # .xls (format lama) -- butuh library xlrd
+    try:
+        import xlrd  # noqa: F401
+    except ImportError:
+        raise RuntimeError(
+            "format .xls membutuhkan library xlrd yang belum "
+            "terpasang. Simpan ulang file sebagai .xlsx lalu "
+            "upload lagi."
+        )
+
+    frames = pd.read_excel(
+        io.BytesIO(data),
+        sheet_name=None,
+        header=None,
+        dtype=object,
+        engine="xlrd",
+    )
+
+    for name, frame in frames.items():
+        frame = frame.astype(object).where(frame.notna(), None)
+
+        sheets.append((str(name), frame.values.tolist()))
+
+    return sheets
+
+
+def consol_natural_key(text):
+    """Urutan alami: angka diurutkan sebagai angka (2 < 10)."""
+
+    key = []
+
+    for part in re.split(r"(\d+)", str(text)):
+        if part == "":
+            continue
+
+        if part.isdigit():
+            key.append((0, int(part), ""))
+        else:
+            key.append((1, 0, part.lower()))
+
+    return key
+
+
+def consol_number(value):
+    """Angka bulat ditulis sebagai int, selain itu dibulatkan 6 desimal."""
+
+    value = round(float(value), 6)
+
+    return int(value) if value == int(value) else value
+
+
+def consol_clean_cell(value):
+    """Buang karakter yang tidak boleh ada di sel Excel."""
+
+    if isinstance(value, str):
+        return ILLEGAL_CHARACTERS_RE.sub("", value)
+
+    return value
+
+
+def consol_process_files(
+    files,
+    skip_total=True,
+    default_one=True,
+    include_original=False,
+):
+    """
+    files: [(nama_file, bytes)].
+
+    Return dict: records, pivot (dict barcode -> total), file_count,
+    sheet_count, errors, originals.
+    """
+
+    records = []
+    pivot = {}
+    originals = []
+    errors = []
+    sheet_count = 0
+    file_count = 0
+
+    for file_idx, (file_name, data) in enumerate(files):
+        file_label = re.sub(
+            r"\.(xlsx|xls|xlsm)$",
+            "",
+            file_name,
+            flags=re.IGNORECASE,
+        )
+
+        try:
+            sheets = consol_read_workbook(file_name, data)
+        except Exception as exc:
+            errors.append(f'Gagal membaca "{file_name}": {exc}')
+            continue
+
+        file_count += 1
+
+        for raw_name, raw_rows in sheets:
+            sheet_clean = str(raw_name).strip()
+
+            if include_original:
+                originals.append((file_idx, raw_name, raw_rows))
+
+            if skip_total and CONSOL_SKIP_SHEET.match(sheet_clean):
+                continue
+
+            rows = consol_trim_rows(raw_rows)
+
+            if not rows:
+                continue
+
+            sheet_records, has_data = consol_extract_sheet(
+                rows,
+                sheet_clean,
+                file_label,
+                default_one,
+            )
+
+            records.extend(sheet_records)
+
+            for record in sheet_records:
+                pivot[record[0]] = (
+                    pivot.get(record[0], 0) + record[1]
+                )
+
+            if has_data:
+                sheet_count += 1
+
+    return {
+        "records": records,
+        "pivot": pivot,
+        "file_count": file_count,
+        "sheet_count": sheet_count,
+        "errors": errors,
+        "originals": originals,
+    }
+
+
+def consol_build_excel(
+    records,
+    pivot_items,
+    make_pivot=True,
+    originals=None,
+    total_files=1,
+):
+    """Excel hasil: sheet PIVOT, REKAP SHEET, (opsional) sheet asli."""
+
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+
+    bold = Font(bold=True)
+
+    used_names = {"PIVOT", "REKAP SHEET"}
+
+    if make_pivot:
+        sheet = workbook.create_sheet("PIVOT")
+
+        sheet.append(["Row Labels", "Sum of COUNT"])
+
+        for barcode, total in pivot_items:
+            sheet.append(
+                [consol_clean_cell(barcode), consol_number(total)]
+            )
+
+        sheet.append(
+            [
+                "Grand Total",
+                consol_number(sum(t for _, t in pivot_items)),
+            ]
+        )
+
+        for cell in sheet[1]:
+            cell.font = bold
+
+        sheet.column_dimensions["A"].width = 24
+        sheet.column_dimensions["B"].width = 16
+
+    sheet = workbook.create_sheet("REKAP SHEET")
+
+    sheet.append(CONSOL_REKAP_HEADER)
+
+    for barcode, qty, ket, sheet_name, file_label in records:
+        sheet.append(
+            [
+                consol_clean_cell(barcode),
+                consol_number(qty),
+                consol_clean_cell(ket),
+                consol_clean_cell(sheet_name),
+                consol_clean_cell(file_label),
+            ]
+        )
+
+    for cell in sheet[1]:
+        cell.font = bold
+
+    for letter, width in zip("ABCDE", (24, 10, 18, 18, 26)):
+        sheet.column_dimensions[letter].width = width
+
+    for file_idx, sheet_name, rows in originals or []:
+        if CONSOL_SKIP_ORIGINAL.match(str(sheet_name).strip()):
+            continue
+
+        prefix = f"F{file_idx + 1}_" if total_files > 1 else ""
+
+        base = prefix + str(sheet_name).strip()
+
+        target = base[:31]
+
+        counter = 1
+
+        while target.upper() in used_names:
+            suffix = f"_{counter}"
+
+            counter += 1
+
+            target = base[: 31 - len(suffix)] + suffix
+
+        used_names.add(target.upper())
+
+        copy = workbook.create_sheet(target)
+
+        for row in rows:
+            copy.append([consol_clean_cell(v) for v in row])
+
+    buffer = io.BytesIO()
+
+    workbook.save(buffer)
+
+    return buffer.getvalue()
+
+
+def consol_build_csv(records):
+    """CSV REKAP SHEET (UTF-8 dengan BOM supaya aman dibuka di Excel)."""
+
+    buffer = io.StringIO()
+
+    writer = csv.writer(buffer, lineterminator="\n")
+
+    writer.writerow(CONSOL_REKAP_HEADER)
+
+    for barcode, qty, ket, sheet_name, file_label in records:
+        writer.writerow(
+            [barcode, consol_number(qty), ket, sheet_name, file_label]
+        )
+
+    return buffer.getvalue().encode("utf-8-sig")
+
+
+def consol_run(
+    files,
+    skip_total=True,
+    default_one=True,
+    make_pivot=True,
+    include_original=False,
+):
+    """Proses semua file lalu siapkan statistik, preview, dan file unduhan."""
+
+    processed = consol_process_files(
+        files,
+        skip_total=skip_total,
+        default_one=default_one,
+        include_original=include_original,
+    )
+
+    records = processed["records"]
+
+    pivot_items = sorted(
+        processed["pivot"].items(),
+        key=lambda item: consol_natural_key(item[0]),
+    )
+
+    total_qty = round(sum(r[1] for r in records), 6)
+
+    result = {
+        "file_count": processed["file_count"],
+        "sheet_count": processed["sheet_count"],
+        "row_count": len(records),
+        "qty": total_qty,
+        "unique": len(pivot_items),
+        "errors": processed["errors"],
+        "pivot_preview": pd.DataFrame(
+            [
+                (b, consol_number(t))
+                for b, t in pivot_items[:CONSOL_PREVIEW_ROWS]
+            ],
+            columns=["Row Labels (BARCODE)", "Sum of COUNT"],
+        ),
+        "rekap_preview": pd.DataFrame(
+            [
+                (b, consol_number(q), k, s, f)
+                for b, q, k, s, f in records[:CONSOL_PREVIEW_ROWS]
+            ],
+            columns=["BARCODE", "COUNT", "KET", "SHEET", "NAMA FILE"],
+        ),
+        "excel": None,
+        "csv": None,
+        "excel_label": (
+            "Download Hasil Excel (PIVOT + REKAP SHEET)"
+            if make_pivot
+            else "Download Hasil Excel (REKAP SHEET)"
+        ),
+    }
+
+    if records:
+        result["excel"] = consol_build_excel(
+            records,
+            pivot_items,
+            make_pivot=make_pivot,
+            originals=processed["originals"],
+            total_files=len(files),
+        )
+
+        result["csv"] = consol_build_csv(records)
+
+    return result
+
+
+def consol_format_number(value):
+    """Format angka gaya Indonesia: 1.234 atau 1.234,5."""
+
+    value = consol_number(value)
+
+    if isinstance(value, int):
+        return f"{value:,}".replace(",", ".")
+
+    text = f"{value:,.2f}".rstrip("0").rstrip(".")
+
+    return text.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def render_consolidator_page():
+    """Halaman menu 'Konsolidasi Excel'."""
+
+    st.subheader("🧮 Konsolidasi Excel")
+
+    st.caption(
+        "Gabungkan data scan dari banyak file Excel & banyak sheet "
+        "sekaligus menjadi satu (REKAP SHEET & PIVOT)."
+    )
+
+    reset_count = st.session_state.get("consol_reset_count", 0)
+
+    st.markdown("**1. Upload file Excel** (bisa pilih beberapa file)")
+
+    uploaded_files = st.file_uploader(
+        "Pilih file Excel (.xlsx / .xls / .xlsm)",
+        type=["xlsx", "xls", "xlsm"],
+        accept_multiple_files=True,
+        key=f"consol_files_{reset_count}",
+        help=(
+            "Mendukung upload banyak file sekaligus. Format 1 kolom "
+            "(QTY otomatis 1), 2 kolom (Barcode + KOLI/KET atau "
+            "Barcode + QTY), serta format berpasangan multi-kolom "
+            "(WALL 1 | QTY | WALL 2 | QTY). File .xls lama "
+            "sebaiknya disimpan dulu sebagai .xlsx."
+        ),
+    )
+
+    skip_total = st.checkbox(
+        "Abaikan sheet bernama TOTAL / REKAP / PIVOT",
+        value=True,
+        key="consol_skip_total",
+    )
+
+    default_one = st.checkbox(
+        "Jadikan QTY = 1 jika kolom QTY kosong / bukan angka",
+        value=True,
+        key="consol_default_one",
+    )
+
+    make_pivot = st.checkbox(
+        "Buat ringkasan sheet PIVOT otomatis",
+        value=True,
+        key="consol_make_pivot",
+    )
+
+    include_original = st.checkbox(
+        "Sertakan sheet asli dari semua file ke hasil Excel",
+        value=False,
+        key="consol_include_original",
+    )
+
+    st.caption(
+        "Setelah mengubah pilihan di atas, klik Proses lagi."
+    )
+
+    process_clicked = st.button(
+        "Proses & Gabungkan Semua File",
+        type="primary",
+        disabled=not uploaded_files,
+        use_container_width=True,
+        key="consol_process",
+    )
+
+    if uploaded_files:
+        st.caption(f"{len(uploaded_files)} file siap diproses.")
+
+    if st.session_state.get("consol_result") or uploaded_files:
+        if st.button(
+            "Reset Pilihan",
+            use_container_width=True,
+            key="consol_reset",
+        ):
+            st.session_state.pop("consol_result", None)
+            st.session_state["consol_reset_count"] = reset_count + 1
+            st.rerun()
+
+    if process_clicked and uploaded_files:
+        payload = [(f.name, f.getvalue()) for f in uploaded_files]
+
+        with st.spinner(f"Membaca {len(payload)} file..."):
+            st.session_state["consol_result"] = consol_run(
+                payload,
+                skip_total=skip_total,
+                default_one=default_one,
+                make_pivot=make_pivot,
+                include_original=include_original,
+            )
+
+    result = st.session_state.get("consol_result")
+
+    st.markdown("---")
+
+    st.markdown("**2. Hasil rekap gabungan**")
+
+    if not result:
+        st.info(
+            "Belum ada data. Pilih satu atau beberapa file Excel "
+            "lalu klik Proses."
+        )
+
+        return
+
+    for message in result["errors"]:
+        st.error(message)
+
+    if not result["row_count"]:
+        st.warning(
+            "Tidak ada data yang bisa digabungkan dari file yang "
+            "dipilih."
+        )
+
+        return
+
+    st.success(
+        f"Selesai! {result['file_count']} file "
+        f"({result['sheet_count']} sheet) berhasil digabungkan "
+        f"menjadi {consol_format_number(result['row_count'])} baris."
+    )
+
+    col_files, col_rows, col_qty, col_unique = st.columns(4)
+
+    col_files.metric(
+        "File Diproses", consol_format_number(result["file_count"])
+    )
+
+    col_rows.metric(
+        "Total Baris REKAP", consol_format_number(result["row_count"])
+    )
+
+    col_qty.metric(
+        "Total COUNT / QTY", consol_format_number(result["qty"])
+    )
+
+    col_unique.metric(
+        "Barcode Unik (PIVOT)", consol_format_number(result["unique"])
+    )
+
+    tab_pivot, tab_rekap = st.tabs(
+        ["Preview PIVOT", "Preview REKAP SHEET"]
+    )
+
+    with tab_pivot:
+        st.dataframe(
+            result["pivot_preview"],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if result["unique"] > CONSOL_PREVIEW_ROWS:
+            st.caption(
+                f"Menampilkan {CONSOL_PREVIEW_ROWS} baris pertama dari "
+                f"{consol_format_number(result['unique'])} barcode "
+                "unik. Download Excel untuk data lengkap."
+            )
+
+    with tab_rekap:
+        st.dataframe(
+            result["rekap_preview"],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if result["row_count"] > CONSOL_PREVIEW_ROWS:
+            st.caption(
+                f"Menampilkan {CONSOL_PREVIEW_ROWS} baris pertama dari "
+                f"{consol_format_number(result['row_count'])} baris. "
+                "Download Excel untuk data lengkap."
+            )
+
+    st.download_button(
+        result["excel_label"],
+        data=result["excel"],
+        file_name=CONSOL_EXCEL_NAME,
+        mime=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+        type="primary",
+        use_container_width=True,
+        key="consol_download_excel",
+    )
+
+    st.download_button(
+        "Download CSV (REKAP SHEET)",
+        data=result["csv"],
+        file_name=CONSOL_CSV_NAME,
+        mime="text/csv",
+        use_container_width=True,
+        key="consol_download_csv",
+    )
+
+
+# ---- KONSOLIDASI EXCEL: SELESAI ----
+
+
 # Komponen penyimpan sesi: dipasang di setiap run (tak terlihat).
 _auth_stored = _auth_storage_sync()
 
@@ -7249,6 +8069,15 @@ with st.sidebar:
             else ""
         )
         + ")"
+    )
+
+    st.radio(
+        "Menu",
+        [
+            "📊 Analisa Stock Opname",
+            "🧮 Konsolidasi Excel",
+        ],
+        key="app_menu",
     )
 
     show_more_menu = st.checkbox(
@@ -7277,6 +8106,18 @@ if (
     with st.sidebar:
         _render_admin_panel()
         st.markdown("---")
+
+
+# ============================================================
+# MENU: KONSOLIDASI EXCEL (halaman terpisah dari Analisa SO)
+# ============================================================
+
+if st.session_state.get("app_menu") == "🧮 Konsolidasi Excel":
+    _render_app_header()
+
+    render_consolidator_page()
+
+    st.stop()
 
 
 # ============================================================
