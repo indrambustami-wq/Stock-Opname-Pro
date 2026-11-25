@@ -7243,6 +7243,8 @@ def _render_change_password_self():
 #   - 2 kolom  : Barcode + QTY, atau Barcode + KOLI/KET (teks
 #                di kolom 2 menjadi KET untuk baris-baris di
 #                bawahnya)
+#   - tanpa judul, SEMUA kolom berisi barcode (tanpa QTY/KET):
+#     setiap sel barcode dihitung 1, KET = nama sheet
 #   - berpasangan multi-kolom: baris 1 berisi nama lokasi,
 #     mis. WALL 1 | QTY | WALL 2 | QTY
 #   - sheet TANPA judul (baris 1 langsung barcode) dikenali dari
@@ -7439,6 +7441,77 @@ def consol_first_row_is_data(rows, sample_size=200):
     return False
 
 
+def consol_code_shape(text):
+    """Bentuk ringkas: huruf -> a, angka berurutan -> 9 (h000123 -> a9)."""
+
+    shape = consol_shape(text)
+
+    return re.sub(r"9+", "9", re.sub(r"a+", "a", shape))
+
+
+def consol_barcode_columns(rows, sample_size=200):
+    """
+    Deteksi sheet tanpa judul yang SEMUA kolomnya berisi barcode
+    (tanpa kolom QTY/KET). Return daftar indeks kolom barcode kalau
+    ada >= 2 kolom berbentuk barcode seperti kolom pertama, jika
+    tidak return [].
+
+    Kolom QTY (angka murni) atau KET/KOLI (mis. "KOLI 1") bentuknya
+    beda dengan barcode, jadi tidak ikut dihitung.
+    """
+
+    if not rows:
+        return []
+
+    width = max(len(r) for r in rows)
+
+    def column_texts(col):
+        out = []
+
+        for row in rows[:sample_size]:
+            if col < len(row):
+                t = consol_cell_text(row[col]).strip()
+
+                if t != "":
+                    out.append(t)
+
+        return out
+
+    base = column_texts(0)
+
+    if not base:
+        return []
+
+    counts = {}
+
+    for t in base:
+        k = consol_code_shape(t)
+        counts[k] = counts.get(k, 0) + 1
+
+    base_shape = max(counts, key=counts.get)
+
+    # kolom pertama harus benar-benar barcode (huruf+angka)
+    if base_shape != "a9" or counts[base_shape] * 2 < len(base):
+        return []
+
+    cols = [0]
+
+    for col in range(1, width):
+        texts = column_texts(col)
+
+        if not texts:
+            continue
+
+        same = sum(
+            1 for t in texts if consol_code_shape(t) == base_shape
+        )
+
+        if same * 2 >= len(texts):
+            cols.append(col)
+
+    return cols if len(cols) >= 2 else []
+
+
 def consol_extract_sheet(
     rows,
     sheet_name,
@@ -7524,6 +7597,33 @@ def consol_extract_sheet(
                 )
 
             c += 2  # lewati kolom QTY pasangannya
+
+    elif (
+        consol_first_row_is_data(rows)
+        and len(consol_barcode_columns(rows)) >= 2
+    ):
+        # Sheet tanpa judul, semua kolom berisi barcode
+        # (tanpa QTY/KET): tiap sel barcode = 1 record, QTY 1,
+        # KET = nama sheet.
+        barcode_cols = consol_barcode_columns(rows)
+
+        for row in rows:
+            for col in barcode_cols:
+                barcode = text(row, col)
+
+                if not barcode or CONSOL_SKIP_WORDS_SINGLE.match(
+                    barcode
+                ):
+                    continue
+
+                has_data = True
+
+                if empty_qty <= 0:
+                    continue
+
+                records.append(
+                    (barcode, 1, sheet_name, sheet_name, file_label)
+                )
 
     else:
         # Format 1 kolom atau 2 kolom
