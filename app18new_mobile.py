@@ -449,6 +449,7 @@ LOCATION_INITIALS = {
     "HWRB050": "HPF",
     "HWRB051": "HLKC",
     "HWRB052": "HLCT",
+    "HWRB053": "HLSY",
     "HWRC001": "LMP",
     "HWRC002": "BJM",
     "HWRC003": "BJQ",
