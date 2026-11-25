@@ -10,6 +10,7 @@ import secrets as pysecrets
 import tempfile
 import time
 import warnings
+from copy import copy as shallow_copy
 from datetime import datetime
 from html import escape as html_escape
 
@@ -7243,6 +7244,9 @@ def _render_change_password_self():
 #                bawahnya)
 #   - berpasangan multi-kolom: baris 1 berisi nama lokasi,
 #     mis. WALL 1 | QTY | WALL 2 | QTY
+#   - sheet TANPA judul (baris 1 langsung barcode) dikenali dari
+#     bentuk sel baris 1 yang sama dengan isi kolomnya, sehingga
+#     barcode pertama tidak salah dianggap nama lokasi.
 # ============================================================
 
 CONSOL_SKIP_SHEET = re.compile(
@@ -7261,6 +7265,10 @@ CONSOL_NUMBER = re.compile(
     r"^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$"
 )
 CONSOL_PREVIEW_ROWS = 500
+# Sheet asli disalin lengkap dengan format kalau total sel satu file
+# tidak lebih dari batas ini; file yang lebih besar disalin nilainya saja
+# (supaya tetap cepat dan hemat memori).
+CONSOL_FORMAT_COPY_MAX_CELLS = 400_000
 CONSOL_REKAP_HEADER = ["BARCODE", "COUNT", "KET", "SHEET", "FILE"]
 CONSOL_EXCEL_NAME = "HASIL_REKAP_GABUNGAN_SO.xlsx"
 CONSOL_CSV_NAME = "REKAP_SHEET_GABUNGAN.csv"
@@ -7367,6 +7375,69 @@ def consol_trim_rows(rows):
     return trimmed
 
 
+def consol_shape(text):
+    """
+    Bentuk teks: angka -> 9, huruf -> a, lainnya tetap.
+    Contoh: h00000094351 -> a99999999999
+    """
+
+    shape = []
+
+    for char in str(text):
+        if char.isdigit():
+            shape.append("9")
+        elif char.isalpha():
+            shape.append("a")
+        else:
+            shape.append(char)
+
+    return "".join(shape)
+
+
+def consol_first_row_is_data(rows, sample_size=200):
+    """
+    True kalau baris pertama sebenarnya DATA (bukan judul/header).
+
+    Sel di baris pertama dianggap data kalau bentuknya sama dengan
+    sebagian besar isi kolomnya di bawah. Contoh: sheet tanpa judul
+    yang A1-nya langsung barcode (h00000094351) seperti isi A2, A3,
+    dst. Header sungguhan (WALL 1, QTY, ...) bentuknya beda dengan
+    barcode di bawahnya.
+    """
+
+    if len(rows) < 2:
+        return False
+
+    first_row = rows[0]
+
+    for col, value in enumerate(first_row):
+        header = consol_cell_text(value).strip()
+
+        if header == "":
+            continue
+
+        below = []
+
+        for row in rows[1:sample_size + 1]:
+            if col < len(row):
+                text = consol_cell_text(row[col]).strip()
+
+                if text != "":
+                    below.append(text)
+
+        if not below:
+            continue
+
+        shape = consol_shape(header)
+
+        same = sum(1 for text in below if consol_shape(text) == shape)
+
+        if same * 2 >= len(below):
+            return True
+
+    return False
+
+
 def consol_extract_sheet(
     rows,
     sheet_name,
@@ -7399,7 +7470,11 @@ def consol_extract_sheet(
 
     filled_headers = [h for h in headers if h != ""]
 
-    is_multi_pair = width >= 3 and len(filled_headers) >= 2
+    is_multi_pair = (
+        width >= 3
+        and len(filled_headers) >= 2
+        and not consol_first_row_is_data(rows)
+    )
 
     empty_qty = 1 if default_one else 0
 
@@ -7582,6 +7657,64 @@ def consol_clean_cell(value):
     return value
 
 
+def consol_copy_sheet_formatted(source, target):
+    """
+    Salin satu sheet asli beserta tampilannya: nilai, format angka,
+    font, warna isi, garis, perataan, lebar kolom, tinggi baris,
+    sel gabungan, dan freeze panes.
+    """
+
+    for row in source.iter_rows():
+        for cell in row:
+            if cell.value is None and not cell.has_style:
+                continue
+
+            new_cell = target.cell(
+                row=cell.row,
+                column=cell.column,
+            )
+
+            value = consol_clean_cell(cell.value)
+
+            new_cell.value = value
+
+            # teks yang kebetulan diawali "=" jangan jadi rumus
+            if (
+                isinstance(value, str)
+                and value.startswith("=")
+                and cell.data_type == "s"
+            ):
+                new_cell.data_type = "s"
+
+            if cell.has_style:
+                new_cell.font = shallow_copy(cell.font)
+                new_cell.fill = shallow_copy(cell.fill)
+                new_cell.border = shallow_copy(cell.border)
+                new_cell.alignment = shallow_copy(cell.alignment)
+                new_cell.protection = shallow_copy(cell.protection)
+                new_cell.number_format = cell.number_format
+
+    for letter, dim in source.column_dimensions.items():
+        new_dim = target.column_dimensions[letter]
+
+        new_dim.min = dim.min
+        new_dim.max = dim.max
+        new_dim.width = dim.width
+        new_dim.hidden = dim.hidden
+
+    for index, dim in source.row_dimensions.items():
+        new_dim = target.row_dimensions[index]
+
+        new_dim.height = dim.height
+        new_dim.hidden = dim.hidden
+
+    for merged in source.merged_cells.ranges:
+        target.merge_cells(str(merged))
+
+    if source.freeze_panes:
+        target.freeze_panes = source.freeze_panes
+
+
 def consol_process_files(
     files,
     skip_total=True,
@@ -7598,6 +7731,7 @@ def consol_process_files(
     records = []
     pivot = {}
     originals = []
+    sources = {}
     errors = []
     sheet_count = 0
     file_count = 0
@@ -7617,6 +7751,15 @@ def consol_process_files(
             continue
 
         file_count += 1
+
+        if include_original:
+            total_cells = sum(
+                len(row)
+                for _, sheet_rows in sheets
+                for row in sheet_rows
+            )
+
+            sources[file_idx] = (data, total_cells)
 
         for raw_name, raw_rows in sheets:
             sheet_clean = str(raw_name).strip()
@@ -7656,6 +7799,7 @@ def consol_process_files(
         "sheet_count": sheet_count,
         "errors": errors,
         "originals": originals,
+        "sources": sources,
     }
 
 
@@ -7665,6 +7809,7 @@ def consol_build_excel(
     make_pivot=True,
     originals=None,
     total_files=1,
+    sources=None,
 ):
     """Excel hasil: sheet PIVOT, REKAP SHEET, (opsional) sheet asli."""
 
@@ -7719,6 +7864,31 @@ def consol_build_excel(
     for letter, width in zip("ABCDE", (24, 10, 18, 18, 26)):
         sheet.column_dimensions[letter].width = width
 
+    source_books = {}
+
+    def source_book(file_idx):
+        """Buku asli (dengan format) untuk file ini, atau None."""
+
+        if file_idx in source_books:
+            return source_books[file_idx]
+
+        book = None
+
+        source = (sources or {}).get(file_idx)
+
+        if source and source[1] <= CONSOL_FORMAT_COPY_MAX_CELLS:
+            try:
+                book = load_workbook(
+                    io.BytesIO(source[0]),
+                    data_only=True,
+                )
+            except Exception:
+                book = None
+
+        source_books[file_idx] = book
+
+        return book
+
     for file_idx, sheet_name, rows in originals or []:
         if CONSOL_SKIP_ORIGINAL.match(str(sheet_name).strip()):
             continue
@@ -7740,10 +7910,31 @@ def consol_build_excel(
 
         used_names.add(target.upper())
 
-        copy = workbook.create_sheet(target)
+        copied_sheet = workbook.create_sheet(target)
 
-        for row in rows:
-            copy.append([consol_clean_cell(v) for v in row])
+        copied = False
+
+        book = source_book(file_idx)
+
+        if book is not None and sheet_name in book.sheetnames:
+            try:
+                consol_copy_sheet_formatted(
+                    book[sheet_name],
+                    copied_sheet,
+                )
+
+                copied = True
+            except Exception:
+                workbook.remove(copied_sheet)
+
+                copied_sheet = workbook.create_sheet(target)
+
+        if not copied:
+            # cadangan: salin nilainya saja
+            for row in rows:
+                copied_sheet.append(
+                    [consol_clean_cell(v) for v in row]
+                )
 
     buffer = io.BytesIO()
 
@@ -7831,6 +8022,7 @@ def consol_run(
             make_pivot=make_pivot,
             originals=processed["originals"],
             total_files=len(files),
+            sources=processed["sources"],
         )
 
         result["csv"] = consol_build_csv(records)
@@ -7901,6 +8093,12 @@ def render_consolidator_page():
         "Sertakan sheet asli dari semua file ke hasil Excel",
         value=False,
         key="consol_include_original",
+        help=(
+            "Sheet asli disalin lengkap dengan lebar kolom, warna, "
+            "format angka, dan sel gabungan. Untuk file yang sangat "
+            "besar, hanya nilainya yang disalin. Sheet bernama "
+            "PIVOT / REKAP SHEET tidak ikut disalin."
+        ),
     )
 
     st.caption(
